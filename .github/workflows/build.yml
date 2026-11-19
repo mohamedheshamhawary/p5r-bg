@@ -1,0 +1,19 @@
+name: build-winmm
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Build
+        shell: cmd
+        run: cl /nologo /O2 /MT /LD winmm.c /link /OUT:winmm.dll user32.lib kernel32.lib
+      - uses: actions/upload-artifact@v4
+        with:
+          name: winmm-dll
+          path: winmm.dll
