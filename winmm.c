@@ -1,15 +1,16 @@
 /*
- * P5R "keep running in background" - tiny winmm.dll proxy.
+ * P5R "keep running in background" - tiny winmm.dll proxy (v3).
  * Put the built winmm.dll next to P5R.exe. Delete it to undo.
  *
- * What it does (only inside the game's own process):
- *  1) Swallows the "window lost focus / deactivated" messages so the game never learns it was alt-tabbed.
- *  2) Makes GetForegroundWindow / GetActiveWindow / GetFocus always answer "the game window"
- *     (in case the game polls focus instead of listening to messages).
- *  3) While the game is NOT the real foreground window, it reads as "no keys pressed" (keyboard + controller),
- *     so typing in another window does not press buttons in the game.
+ * Inside the game's own process only:
+ *  1) background  : swallows "lost focus / deactivated" messages so the game keeps running when alt-tabbed.
+ *  2) spoof_focus : GetForegroundWindow / GetActiveWindow / GetFocus answer "the game window".
+ *  3) block_*     : while ANOTHER app is in front, the game sees no keyboard / mouse / controller input.
  * Everything else in winmm is forwarded to the real Windows winmm.dll.
- * Writes a small log: p5r_bg.log (in the game folder) so we can see what happened.
+ *
+ * Every feature can be switched off in p5r_bg.ini (created next to the DLL on first run).
+ * Changes apply within about a second, no need to restart the game.
+ * p5r_bg.log (same folder) shows what happened.
  */
 #define _CRT_SECURE_NO_WARNINGS
 #define WIN32_LEAN_AND_MEAN
@@ -212,10 +213,20 @@
 #pragma comment(linker, "/export:wid32Message=C:\\Windows\\System32\\winmm.wid32Message")
 #pragma comment(linker, "/export:wod32Message=C:\\Windows\\System32\\winmm.wod32Message")
 
-/* ---------- log ---------- */
+/* ---------- settings / paths ---------- */
+static HINSTANCE g_inst = NULL;
+static char g_iniPath[MAX_PATH + 16] = "p5r_bg.ini";
+static char g_logPath[MAX_PATH + 16] = "p5r_bg.log";
+
+static volatile LONG cfg_background       = 1;
+static volatile LONG cfg_spoof_focus      = 1;
+static volatile LONG cfg_block_keyboard   = 1;
+static volatile LONG cfg_block_mouse      = 1;
+static volatile LONG cfg_block_controller = 1;
+
 static void LogMsg(const char *fmt, ...)
 {
-    FILE *f = fopen("p5r_bg.log", "a");
+    FILE *f = fopen(g_logPath, "a");
     va_list ap;
     if (!f) return;
     va_start(ap, fmt);
@@ -225,48 +236,95 @@ static void LogMsg(const char *fmt, ...)
     fclose(f);
 }
 
+static void InitPaths(void)
+{
+    char dir[MAX_PATH + 16];
+    char *p;
+    DWORD n = GetModuleFileNameA(g_inst, dir, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return;
+    p = strrchr(dir, '\\');
+    if (!p) return;
+    p[1] = 0;
+    lstrcpyA(g_iniPath, dir); lstrcatA(g_iniPath, "p5r_bg.ini");
+    lstrcpyA(g_logPath, dir); lstrcatA(g_logPath, "p5r_bg.log");
+}
+
+static void WriteDefaultIni(void)
+{
+    FILE *f;
+    if (GetFileAttributesA(g_iniPath) != INVALID_FILE_ATTRIBUTES) return;
+    f = fopen(g_iniPath, "w");
+    if (!f) return;
+    fputs("; p5r_bg settings. 1 = on, 0 = off.\n"
+          "; Changes apply within about a second, no need to restart the game.\n"
+          "[main]\n"
+          "; game keeps running when you alt-tab\n"
+          "background=1\n"
+          "; game believes its window is always the active one (needed by some games, try 0 if something breaks)\n"
+          "spoof_focus=1\n"
+          "; while another app is in front, the game ignores the keyboard\n"
+          "block_keyboard=1\n"
+          "; ... the mouse\n"
+          "block_mouse=1\n"
+          "; ... the controller\n"
+          "block_controller=1\n", f);
+    fclose(f);
+}
+
+static void ReadConfig(void)
+{
+    InterlockedExchange(&cfg_background,       GetPrivateProfileIntA("main", "background",       1, g_iniPath));
+    InterlockedExchange(&cfg_spoof_focus,      GetPrivateProfileIntA("main", "spoof_focus",      1, g_iniPath));
+    InterlockedExchange(&cfg_block_keyboard,   GetPrivateProfileIntA("main", "block_keyboard",   1, g_iniPath));
+    InterlockedExchange(&cfg_block_mouse,      GetPrivateProfileIntA("main", "block_mouse",      1, g_iniPath));
+    InterlockedExchange(&cfg_block_controller, GetPrivateProfileIntA("main", "block_controller", 1, g_iniPath));
+}
+
 static HWND    g_hwnd = NULL;
 static WNDPROC g_orig = NULL;
 static BOOL    g_unicode = TRUE;
 
-/* TRUE only when a window of THIS process is really in the foreground.
-   (Our own imports are not patched, so this is the real answer.) */
-static BOOL IsGameFocused(void)
+/* TRUE only when ANOTHER program's window is really in front.
+   (If we can't tell, we say FALSE so the game keeps working normally.
+   Our own imports are not patched, so GetForegroundWindow here is the real one.) */
+static BOOL ForegroundIsOtherApp(void)
 {
     static DWORD last = 0;
-    static BOOL cached = TRUE;
+    static BOOL cached = FALSE;
     DWORD now = GetTickCount();
     if (now - last >= 15) {
         DWORD pid = 0;
         HWND fg = GetForegroundWindow();
         if (fg) GetWindowThreadProcessId(fg, &pid);
-        cached = (fg != NULL && pid == GetCurrentProcessId());
+        cached = (fg != NULL && pid != GetCurrentProcessId());
         last = now;
     }
     return cached;
 }
 
-/* ---------- window procedure that hides focus loss ---------- */
+/* ---------- window procedure ---------- */
 static LRESULT CALLBACK NewProc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
-    if (!IsGameFocused()) {
-        if ((m >= WM_KEYFIRST && m <= WM_KEYLAST) || (m >= WM_MOUSEFIRST && m <= WM_MOUSELAST))
-            return 0;
-        if (m == WM_INPUT)
+    if (ForegroundIsOtherApp()) {
+        if (cfg_block_keyboard && m >= WM_KEYFIRST && m <= WM_KEYLAST) return 0;
+        if (cfg_block_mouse && m >= WM_MOUSEFIRST && m <= WM_MOUSELAST) return 0;
+        if ((cfg_block_keyboard || cfg_block_mouse) && m == WM_INPUT)
             return g_unicode ? DefWindowProcW(h, m, w, l) : DefWindowProcA(h, m, w, l);
     }
-    switch (m) {
-    case WM_ACTIVATEAPP:
-        if (!w) return 0;                       /* app deactivated -> ignore */
-        break;
-    case WM_ACTIVATE:
-        if (LOWORD(w) == WA_INACTIVE) return 0; /* window deactivated -> ignore */
-        break;
-    case WM_KILLFOCUS:
-        return 0;                               /* focus lost -> ignore */
-    case WM_NCACTIVATE:
-        w = TRUE;                               /* keep the frame "active" */
-        break;
+    if (cfg_background) {
+        switch (m) {
+        case WM_ACTIVATEAPP:
+            if (!w) return 0;
+            break;
+        case WM_ACTIVATE:
+            if (LOWORD(w) == WA_INACTIVE) return 0;
+            break;
+        case WM_KILLFOCUS:
+            return 0;
+        case WM_NCACTIVATE:
+            w = TRUE;
+            break;
+        }
     }
     return g_unicode ? CallWindowProcW(g_orig, h, m, w, l)
                      : CallWindowProcA(g_orig, h, m, w, l);
@@ -299,36 +357,43 @@ static void EnsureSubclassed(void)
     LogMsg("window %p subclassed (unicode=%d)", (void *)g_hwnd, (int)g_unicode);
 }
 
-/* ---------- IAT hooks for focus polling ---------- */
+/* ---------- IAT hooks ---------- */
 static HWND (WINAPI *oGetForegroundWindow)(void) = NULL;
 static HWND (WINAPI *oGetActiveWindow)(void)     = NULL;
 static HWND (WINAPI *oGetFocus)(void)            = NULL;
 
-static HWND WINAPI hkGetForegroundWindow(void) { return (g_hwnd && IsWindow(g_hwnd)) ? g_hwnd : oGetForegroundWindow(); }
-static HWND WINAPI hkGetActiveWindow(void)     { return (g_hwnd && IsWindow(g_hwnd)) ? g_hwnd : oGetActiveWindow(); }
-static HWND WINAPI hkGetFocus(void)            { return (g_hwnd && IsWindow(g_hwnd)) ? g_hwnd : oGetFocus(); }
+static HWND WINAPI hkGetForegroundWindow(void) { return (cfg_spoof_focus && g_hwnd && IsWindow(g_hwnd)) ? g_hwnd : oGetForegroundWindow(); }
+static HWND WINAPI hkGetActiveWindow(void)     { return (cfg_spoof_focus && g_hwnd && IsWindow(g_hwnd)) ? g_hwnd : oGetActiveWindow(); }
+static HWND WINAPI hkGetFocus(void)            { return (cfg_spoof_focus && g_hwnd && IsWindow(g_hwnd)) ? g_hwnd : oGetFocus(); }
 
-/* ---------- input is blanked while the game is not really focused ---------- */
 typedef struct { WORD wButtons; BYTE bLeftTrigger; BYTE bRightTrigger; SHORT sThumbLX; SHORT sThumbLY; SHORT sThumbRX; SHORT sThumbRY; } MY_XGAMEPAD;
 typedef struct { DWORD dwPacketNumber; MY_XGAMEPAD Gamepad; } MY_XSTATE;
 
-static SHORT (WINAPI *oGetAsyncKeyState)(int)        = NULL;
-static SHORT (WINAPI *oGetKeyState)(int)             = NULL;
-static BOOL  (WINAPI *oGetKeyboardState)(PBYTE)      = NULL;
+static SHORT (WINAPI *oGetAsyncKeyState)(int)              = NULL;
+static SHORT (WINAPI *oGetKeyState)(int)                   = NULL;
+static BOOL  (WINAPI *oGetKeyboardState)(PBYTE)            = NULL;
 static DWORD (WINAPI *oXInputGetState)(DWORD, MY_XSTATE *) = NULL;
 
-static SHORT WINAPI hkGetAsyncKeyState(int vk) { return IsGameFocused() ? oGetAsyncKeyState(vk) : 0; }
-static SHORT WINAPI hkGetKeyState(int vk)      { return IsGameFocused() ? oGetKeyState(vk) : 0; }
+static BOOL BlockKey(int vk)
+{
+    BOOL isMouse = (vk >= 1 && vk <= 6 && vk != 3);
+    if (!ForegroundIsOtherApp()) return FALSE;
+    return isMouse ? (cfg_block_mouse != 0) : (cfg_block_keyboard != 0);
+}
+
+static SHORT WINAPI hkGetAsyncKeyState(int vk) { return BlockKey(vk) ? 0 : oGetAsyncKeyState(vk); }
+static SHORT WINAPI hkGetKeyState(int vk)      { return BlockKey(vk) ? 0 : oGetKeyState(vk); }
 static BOOL  WINAPI hkGetKeyboardState(PBYTE buf)
 {
     BOOL r = oGetKeyboardState(buf);
-    if (r && buf && !IsGameFocused()) memset(buf, 0, 256);
+    if (r && buf && cfg_block_keyboard && ForegroundIsOtherApp()) memset(buf, 0, 256);
     return r;
 }
 static DWORD WINAPI hkXInputGetState(DWORD idx, MY_XSTATE *st)
 {
     DWORD r = oXInputGetState(idx, st);
-    if (r == ERROR_SUCCESS && st && !IsGameFocused()) memset(&st->Gamepad, 0, sizeof(st->Gamepad));
+    if (r == ERROR_SUCCESS && st && cfg_block_controller && ForegroundIsOtherApp())
+        memset(&st->Gamepad, 0, sizeof(st->Gamepad));
     return r;
 }
 
@@ -367,7 +432,7 @@ static BOOL PatchIAT(HMODULE mod, const char *dll, const char *fn, void *repl, v
 /* ---------- log what the game imports (for debugging) ---------- */
 static void LogImports(HMODULE mod)
 {
-    static const char *kw[] = { "Key", "Input", "Async", "Cursor", "Focus", "Foreground", "Active", "Raw", "Joy" };
+    static const char *kw[] = { "Key", "Input", "Async", "Cursor", "Focus", "Foreground", "Active", "Raw", "Joy", "Ime", "Char", "Text" };
     BYTE *base = (BYTE *)mod;
     IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)base;
     IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(base + dos->e_lfanew);
@@ -377,7 +442,7 @@ static void LogImports(HMODULE mod)
     imp = (IMAGE_IMPORT_DESCRIPTOR *)(base + dir.VirtualAddress);
     for (; imp->Name; imp++) {
         const char *dn = (const char *)(base + imp->Name);
-        int isu = (_stricmp(dn, "user32.dll") == 0);
+        int isu = (_stricmp(dn, "user32.dll") == 0 || _stricmp(dn, "imm32.dll") == 0);
         LogMsg("imports dll: %s", dn);
         if (isu && imp->OriginalFirstThunk) {
             IMAGE_THUNK_DATA *oft = (IMAGE_THUNK_DATA *)(base + imp->OriginalFirstThunk);
@@ -387,7 +452,7 @@ static void LogImports(HMODULE mod)
                 if (IMAGE_SNAP_BY_ORDINAL(oft->u1.Ordinal)) continue;
                 ibn = (IMAGE_IMPORT_BY_NAME *)(base + oft->u1.AddressOfData);
                 for (i = 0; i < sizeof(kw) / sizeof(kw[0]); i++) {
-                    if (strstr((const char *)ibn->Name, kw[i])) { LogMsg("  user32: %s", (const char *)ibn->Name); break; }
+                    if (strstr((const char *)ibn->Name, kw[i])) { LogMsg("  %s: %s", dn, (const char *)ibn->Name); break; }
                 }
             }
         }
@@ -398,17 +463,23 @@ static void LogImports(HMODULE mod)
 static DWORD WINAPI Worker(LPVOID p)
 {
     HMODULE exe;
+    int tick = 0;
     (void)p;
+    InitPaths();
+    { FILE *f = fopen(g_logPath, "w"); if (f) fclose(f); }   /* fresh log each launch */
+    WriteDefaultIni();
+    ReadConfig();
+    LogMsg("p5r_bg v3 started");
+    LogMsg("config: background=%ld spoof_focus=%ld block_keyboard=%ld block_mouse=%ld block_controller=%ld",
+           cfg_background, cfg_spoof_focus, cfg_block_keyboard, cfg_block_mouse, cfg_block_controller);
     Sleep(2000);
     exe = GetModuleHandleW(NULL);
-    LogMsg("worker started");
     LogMsg("IAT GetForegroundWindow: %d", (int)PatchIAT(exe, "user32.dll", "GetForegroundWindow", (void *)hkGetForegroundWindow, (void **)&oGetForegroundWindow));
     LogMsg("IAT GetActiveWindow: %d",     (int)PatchIAT(exe, "user32.dll", "GetActiveWindow",     (void *)hkGetActiveWindow,     (void **)&oGetActiveWindow));
     LogMsg("IAT GetFocus: %d",            (int)PatchIAT(exe, "user32.dll", "GetFocus",            (void *)hkGetFocus,            (void **)&oGetFocus));
-
-    LogMsg("IAT GetAsyncKeyState: %d",   (int)PatchIAT(exe, "user32.dll", "GetAsyncKeyState",   (void *)hkGetAsyncKeyState,  (void **)&oGetAsyncKeyState));
-    LogMsg("IAT GetKeyState: %d",        (int)PatchIAT(exe, "user32.dll", "GetKeyState",        (void *)hkGetKeyState,       (void **)&oGetKeyState));
-    LogMsg("IAT GetKeyboardState: %d",   (int)PatchIAT(exe, "user32.dll", "GetKeyboardState",   (void *)hkGetKeyboardState,  (void **)&oGetKeyboardState));
+    LogMsg("IAT GetAsyncKeyState: %d",    (int)PatchIAT(exe, "user32.dll", "GetAsyncKeyState",    (void *)hkGetAsyncKeyState,    (void **)&oGetAsyncKeyState));
+    LogMsg("IAT GetKeyState: %d",         (int)PatchIAT(exe, "user32.dll", "GetKeyState",         (void *)hkGetKeyState,         (void **)&oGetKeyState));
+    LogMsg("IAT GetKeyboardState: %d",    (int)PatchIAT(exe, "user32.dll", "GetKeyboardState",    (void *)hkGetKeyboardState,    (void **)&oGetKeyboardState));
     {
         static const char *xl[] = { "xinput1_4.dll", "xinput1_3.dll", "xinput9_1_0.dll", "xinput1_2.dll", "xinput1_1.dll" };
         size_t i;
@@ -421,9 +492,9 @@ static DWORD WINAPI Worker(LPVOID p)
 
     for (;;) {
         {
-            static BOOL lastFocus = TRUE;
-            BOOL f = IsGameFocused();
-            if (f != lastFocus) { LogMsg("game focused: %d", (int)f); lastFocus = f; }
+            static BOOL lastOther = FALSE;
+            BOOL o = ForegroundIsOtherApp();
+            if (o != lastOther) { LogMsg("another app in front: %d", (int)o); lastOther = o; }
         }
         if (!g_hwnd || !IsWindow(g_hwnd)) {
             HWND found = NULL;
@@ -432,6 +503,7 @@ static DWORD WINAPI Worker(LPVOID p)
             if (found) { g_hwnd = found; LogMsg("game window found: %p", (void *)found); }
         }
         if (g_hwnd) EnsureSubclassed();
+        if ((tick++ & 1) == 0) ReadConfig();
         Sleep(500);
     }
     return 0;
@@ -442,6 +514,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
     (void)reserved;
     if (reason == DLL_PROCESS_ATTACH) {
         HANDLE t;
+        g_inst = inst;
         DisableThreadLibraryCalls(inst);
         t = CreateThread(NULL, 0, Worker, NULL, 0, NULL);
         if (t) CloseHandle(t);
