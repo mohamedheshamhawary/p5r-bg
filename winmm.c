@@ -6,6 +6,8 @@
  *  1) Swallows the "window lost focus / deactivated" messages so the game never learns it was alt-tabbed.
  *  2) Makes GetForegroundWindow / GetActiveWindow / GetFocus always answer "the game window"
  *     (in case the game polls focus instead of listening to messages).
+ *  3) While the game is NOT the real foreground window, it reads as "no keys pressed" (keyboard + controller),
+ *     so typing in another window does not press buttons in the game.
  * Everything else in winmm is forwarded to the real Windows winmm.dll.
  * Writes a small log: p5r_bg.log (in the game folder) so we can see what happened.
  */
@@ -227,9 +229,32 @@ static HWND    g_hwnd = NULL;
 static WNDPROC g_orig = NULL;
 static BOOL    g_unicode = TRUE;
 
+/* TRUE only when a window of THIS process is really in the foreground.
+   (Our own imports are not patched, so this is the real answer.) */
+static BOOL IsGameFocused(void)
+{
+    static DWORD last = 0;
+    static BOOL cached = TRUE;
+    DWORD now = GetTickCount();
+    if (now - last >= 15) {
+        DWORD pid = 0;
+        HWND fg = GetForegroundWindow();
+        if (fg) GetWindowThreadProcessId(fg, &pid);
+        cached = (fg != NULL && pid == GetCurrentProcessId());
+        last = now;
+    }
+    return cached;
+}
+
 /* ---------- window procedure that hides focus loss ---------- */
 static LRESULT CALLBACK NewProc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
+    if (!IsGameFocused()) {
+        if ((m >= WM_KEYFIRST && m <= WM_KEYLAST) || (m >= WM_MOUSEFIRST && m <= WM_MOUSELAST))
+            return 0;
+        if (m == WM_INPUT)
+            return g_unicode ? DefWindowProcW(h, m, w, l) : DefWindowProcA(h, m, w, l);
+    }
     switch (m) {
     case WM_ACTIVATEAPP:
         if (!w) return 0;                       /* app deactivated -> ignore */
@@ -283,6 +308,30 @@ static HWND WINAPI hkGetForegroundWindow(void) { return (g_hwnd && IsWindow(g_hw
 static HWND WINAPI hkGetActiveWindow(void)     { return (g_hwnd && IsWindow(g_hwnd)) ? g_hwnd : oGetActiveWindow(); }
 static HWND WINAPI hkGetFocus(void)            { return (g_hwnd && IsWindow(g_hwnd)) ? g_hwnd : oGetFocus(); }
 
+/* ---------- input is blanked while the game is not really focused ---------- */
+typedef struct { WORD wButtons; BYTE bLeftTrigger; BYTE bRightTrigger; SHORT sThumbLX; SHORT sThumbLY; SHORT sThumbRX; SHORT sThumbRY; } MY_XGAMEPAD;
+typedef struct { DWORD dwPacketNumber; MY_XGAMEPAD Gamepad; } MY_XSTATE;
+
+static SHORT (WINAPI *oGetAsyncKeyState)(int)        = NULL;
+static SHORT (WINAPI *oGetKeyState)(int)             = NULL;
+static BOOL  (WINAPI *oGetKeyboardState)(PBYTE)      = NULL;
+static DWORD (WINAPI *oXInputGetState)(DWORD, MY_XSTATE *) = NULL;
+
+static SHORT WINAPI hkGetAsyncKeyState(int vk) { return IsGameFocused() ? oGetAsyncKeyState(vk) : 0; }
+static SHORT WINAPI hkGetKeyState(int vk)      { return IsGameFocused() ? oGetKeyState(vk) : 0; }
+static BOOL  WINAPI hkGetKeyboardState(PBYTE buf)
+{
+    BOOL r = oGetKeyboardState(buf);
+    if (r && buf && !IsGameFocused()) memset(buf, 0, 256);
+    return r;
+}
+static DWORD WINAPI hkXInputGetState(DWORD idx, MY_XSTATE *st)
+{
+    DWORD r = oXInputGetState(idx, st);
+    if (r == ERROR_SUCCESS && st && !IsGameFocused()) memset(&st->Gamepad, 0, sizeof(st->Gamepad));
+    return r;
+}
+
 static BOOL PatchIAT(HMODULE mod, const char *dll, const char *fn, void *repl, void **orig)
 {
     BYTE *base = (BYTE *)mod;
@@ -315,6 +364,36 @@ static BOOL PatchIAT(HMODULE mod, const char *dll, const char *fn, void *repl, v
     return FALSE;
 }
 
+/* ---------- log what the game imports (for debugging) ---------- */
+static void LogImports(HMODULE mod)
+{
+    static const char *kw[] = { "Key", "Input", "Async", "Cursor", "Focus", "Foreground", "Active", "Raw", "Joy" };
+    BYTE *base = (BYTE *)mod;
+    IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)base;
+    IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(base + dos->e_lfanew);
+    IMAGE_DATA_DIRECTORY dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    IMAGE_IMPORT_DESCRIPTOR *imp;
+    if (!dir.VirtualAddress) { LogMsg("no import table"); return; }
+    imp = (IMAGE_IMPORT_DESCRIPTOR *)(base + dir.VirtualAddress);
+    for (; imp->Name; imp++) {
+        const char *dn = (const char *)(base + imp->Name);
+        int isu = (_stricmp(dn, "user32.dll") == 0);
+        LogMsg("imports dll: %s", dn);
+        if (isu && imp->OriginalFirstThunk) {
+            IMAGE_THUNK_DATA *oft = (IMAGE_THUNK_DATA *)(base + imp->OriginalFirstThunk);
+            for (; oft->u1.AddressOfData; oft++) {
+                IMAGE_IMPORT_BY_NAME *ibn;
+                size_t i;
+                if (IMAGE_SNAP_BY_ORDINAL(oft->u1.Ordinal)) continue;
+                ibn = (IMAGE_IMPORT_BY_NAME *)(base + oft->u1.AddressOfData);
+                for (i = 0; i < sizeof(kw) / sizeof(kw[0]); i++) {
+                    if (strstr((const char *)ibn->Name, kw[i])) { LogMsg("  user32: %s", (const char *)ibn->Name); break; }
+                }
+            }
+        }
+    }
+}
+
 /* ---------- worker thread ---------- */
 static DWORD WINAPI Worker(LPVOID p)
 {
@@ -327,7 +406,25 @@ static DWORD WINAPI Worker(LPVOID p)
     LogMsg("IAT GetActiveWindow: %d",     (int)PatchIAT(exe, "user32.dll", "GetActiveWindow",     (void *)hkGetActiveWindow,     (void **)&oGetActiveWindow));
     LogMsg("IAT GetFocus: %d",            (int)PatchIAT(exe, "user32.dll", "GetFocus",            (void *)hkGetFocus,            (void **)&oGetFocus));
 
+    LogMsg("IAT GetAsyncKeyState: %d",   (int)PatchIAT(exe, "user32.dll", "GetAsyncKeyState",   (void *)hkGetAsyncKeyState,  (void **)&oGetAsyncKeyState));
+    LogMsg("IAT GetKeyState: %d",        (int)PatchIAT(exe, "user32.dll", "GetKeyState",        (void *)hkGetKeyState,       (void **)&oGetKeyState));
+    LogMsg("IAT GetKeyboardState: %d",   (int)PatchIAT(exe, "user32.dll", "GetKeyboardState",   (void *)hkGetKeyboardState,  (void **)&oGetKeyboardState));
+    {
+        static const char *xl[] = { "xinput1_4.dll", "xinput1_3.dll", "xinput9_1_0.dll", "xinput1_2.dll", "xinput1_1.dll" };
+        size_t i;
+        BOOL ok = FALSE;
+        for (i = 0; i < sizeof(xl) / sizeof(xl[0]) && !ok; i++)
+            ok = PatchIAT(exe, xl[i], "XInputGetState", (void *)hkXInputGetState, (void **)&oXInputGetState);
+        LogMsg("IAT XInputGetState: %d", (int)ok);
+    }
+    LogImports(exe);
+
     for (;;) {
+        {
+            static BOOL lastFocus = TRUE;
+            BOOL f = IsGameFocused();
+            if (f != lastFocus) { LogMsg("game focused: %d", (int)f); lastFocus = f; }
+        }
         if (!g_hwnd || !IsWindow(g_hwnd)) {
             HWND found = NULL;
             g_hwnd = NULL;
